@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -46,7 +47,7 @@ class Usage(BaseModel):
 class ChatCompletionResponse(BaseModel):
     id: str
     object: str = "chat.completion"
-    created: int = Field(default_factory=lambda: __import__("time").time_ns() // 1_000_000_000)
+    created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: list[Choice]
     usage: Usage = Usage()

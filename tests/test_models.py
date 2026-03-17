@@ -46,3 +46,17 @@ def test_response_serializes():
     data = json.loads(resp.model_dump_json())
     assert data["object"] == "chat.completion"
     assert data["choices"][0]["message"]["content"] == "42"
+
+
+def test_request_extra_fields_pass_through():
+    """Extra fields must be preserved — this proxy forwards unknown params to backends."""
+    data = {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "custom_param": "some_value",
+        "another_extra": 42,
+    }
+    req = ChatCompletionRequest.model_validate(data)
+    dumped = req.model_dump()
+    assert dumped["custom_param"] == "some_value"
+    assert dumped["another_extra"] == 42
