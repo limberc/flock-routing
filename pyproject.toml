@@ -15,6 +15,9 @@ dependencies = [
     "tiktoken>=0.7",
 ]
 
+[project.scripts]
+privacy-serving = "privacy_serving.main:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest",
