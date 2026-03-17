@@ -19,7 +19,7 @@ src/privacy_serving/complexity/
     linguistic.py     # LinguisticScorer using pure-Python text features
 ```
 
-No other module changes. The `Router`, `main.py`, and all tests that call `compute_complexity` continue to work without modification. Note: existing threshold assertions in `tests/test_complexity.py` (e.g. `< 0.2`, `>= 0.4`) will be revised to match the new scorer's absolute score distribution.
+Module changes required: `complexity.py` → `complexity/` package (replacement), `main.py` (add lifespan warmup), `pyproject.toml` (swap dependencies). The `Router` and `router.py` are unchanged. All callers of `compute_complexity` continue to work without modification. Note: existing threshold assertions in `tests/test_complexity.py` (e.g. `< 0.2`, `>= 0.4`) will be revised to match the new scorer's absolute score distribution.
 
 New dependencies added to `pyproject.toml`:
 - `transformers>=4.40`
@@ -61,24 +61,30 @@ Calibration table:
 
 All log operations use natural log (`math.log`).
 
+The normalisation formula is defined as a module-level function `_normalise_perplexity(ppl: float) -> float` **in `perplexity.py`** alongside `MIN_PPL` and `MAX_PPL` constants. `__init__.py` imports `_normalise_perplexity` from `perplexity.py` for use in `ComplexityScorer.score_detail()`. This avoids duplication and circular imports.
+
+- The model is loaded lazily on the **first call to `raw_perplexity()`**. Every code path that invokes the model must go through `raw_perplexity()` — including `score()`, which calls it internally. No other loading mechanism is used.
 - If the model fails to load, raise `RuntimeError` with a clear message on first call
-- **Warmup:** `__init__.py` exposes a module-level `warmup()` function that calls `_scorer.perplexity.score("warmup")`. Wire it into `main.py` via a FastAPI lifespan context manager so the model loads at startup rather than on the first live request:
+- **Warmup:** `__init__.py` exposes a module-level `warmup()` function that calls `_scorer.perplexity.score("warmup")`, triggering the first `raw_perplexity()` call and therefore the model load. Wire warmup into `main.py` by passing a `lifespan` argument to `FastAPI()` inside `create_app()`:
   ```python
   from contextlib import asynccontextmanager
   from privacy_serving.complexity import warmup
 
   @asynccontextmanager
-  async def lifespan(app: FastAPI):
+  async def _lifespan(app: FastAPI):
       warmup()
       yield
 
-  app = FastAPI(lifespan=lifespan)
+  def create_app(config: Config) -> FastAPI:
+      app = FastAPI(title="Privacy Serving Proxy", lifespan=_lifespan)
+      # ... rest of create_app unchanged
   ```
-  In tests that construct the app via `create_app()`, patch `privacy_serving.complexity.warmup` to a no-op to avoid loading the model during test collection:
+  In tests that call `create_app()`, patch `privacy_serving.complexity.warmup` to a no-op so the model is not loaded during the test suite:
   ```python
   with patch("privacy_serving.complexity.warmup"):
       app = create_app(config)
   ```
+  Add this patch to the `client` fixture in `tests/test_api.py` and anywhere else `create_app()` is called in tests.
 
 **Latency note:** On Apple Silicon (MPS), distilgpt2 at 512 tokens runs in ~30–60ms. On CPU it may reach 200–400ms — consider setting `MAX_TOKENS = 256` for CPU-only deployments if latency is a concern.
 
@@ -136,6 +142,8 @@ Known limitation: words ending in "le" (e.g., "simple", "able") are underestimat
 **Marker detection** — multi-word markers are detected via `text.lower().count(marker)` (substring match). The single-character marker `if` must use word-boundary matching — `len(re.findall(r'\bif\b', text_lower))` — to avoid false positives inside words like "wifi", "tariff", "notify", "specify". All other markers use `.count()`.
 
 - Conditional markers: `if` (word-boundary), `unless`, `when`, `provided`, `assuming`, `whether`, `given that`, `in case`, `as long as`
+
+Note: `"when"` appears in both the conditional markers list and the STOPWORDS set. This is intentional — STOPWORDS filters words for content-word density calculation; markers are matched in the full lowercased text string for density scoring. The two uses are independent.
 - Discourse connectives: `however`, `therefore`, `thus`, `consequently`, `hence`, `moreover`, `furthermore`, `nevertheless`, `nonetheless`, `although`, `whereas`
 
 **Content-word stopword set** (hardcoded as a `frozenset`, 130 unique words — deduplicated):
@@ -226,8 +234,8 @@ def warmup() -> None:
     """Pre-load the perplexity model. Call from FastAPI lifespan startup."""
 ```
 
-- Text extraction: `" ".join(m.content or "" for m in messages)`
-- Empty messages list → `ComplexityDetail(0.0, 0.0, 0.0, 0.0)`
+- Text extraction: `" ".join(m.content or "" for m in messages)` — `m.content` may be `None`, handled by `or ""`
+- **Early return guard:** if `messages` is empty **or** the extracted text is an empty/whitespace-only string, return `ComplexityDetail(0.0, 0.0, 0.0, 0.0)` immediately — before calling either scorer. This prevents the GPT-2 tokenizer from receiving an empty string, which would produce 0 tokens and raise an error during loss computation.
 - `_scorer = ComplexityScorer()` is a module-level singleton instantiated at import time; the `PerplexityScorer` sub-scorer loads lazily on first use
 - `warmup()` calls `_scorer.perplexity.score("warmup")` to trigger lazy loading at startup
 
@@ -255,10 +263,13 @@ def warmup() -> None:
 - Trivial prompt ("Hi") → score < 0.20
 - Short factual → score < 0.45
 - Complex reasoning prompt → score > 0.55
-- Many questions > single question (relative)
+- Code content prompt (prompt containing a fenced code block) → score > 0.40
+- Math content prompt (prompt containing "theorem", "proof", or asymptotic notation) → score > 0.40
+- Many questions > single question (relative ordering, not absolute threshold)
 - Score bounded [0, 1]
 - Empty messages → 0.0
-- Message-count ordering test dropped (message count is no longer a signal; content is)
+- All-None-content messages (all `m.content = None`) → 0.0
+- Message-count ordering test dropped: message count is no longer a signal. The underlying concern (multi-turn context handled correctly) is covered by the text extraction formula and the `test_empty_messages_returns_zero` test already present.
 
 ---
 
