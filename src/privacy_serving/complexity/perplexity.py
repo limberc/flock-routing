@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import threading
 
 MIN_PPL = 20.0   # practical floor: fluent everyday text
 MAX_PPL = 500.0  # ceiling: dense academic / out-of-distribution text
@@ -13,6 +14,7 @@ _LOG_MAX = math.log(MAX_PPL)
 # Module-level singletons — populated lazily by _load_model()
 _model = None
 _tokenizer = None
+_load_lock = threading.Lock()
 
 
 def _normalise_perplexity(ppl: float) -> float:
@@ -26,31 +28,34 @@ def _load_model() -> None:
     global _model, _tokenizer
     if _model is not None:
         return
-    try:
-        import torch
-        from transformers import GPT2LMHeadModel, GPT2TokenizerFast
-    except ImportError as exc:
-        raise RuntimeError(
-            "Failed to import transformers/torch. "
-            "Install with: pip install 'transformers>=4.40' 'torch>=2.0'"
-        ) from exc
+    with _load_lock:
+        if _model is not None:  # double-checked locking
+            return
+        try:
+            import torch
+            from transformers import GPT2LMHeadModel, GPT2TokenizerFast
+        except ImportError as exc:
+            raise RuntimeError(
+                "Failed to import transformers/torch. "
+                "Install with: pip install 'transformers>=4.40' 'torch>=2.0'"
+            ) from exc
 
-    try:
-        _tokenizer = GPT2TokenizerFast.from_pretrained("distilgpt2")
-        _model = GPT2LMHeadModel.from_pretrained("distilgpt2")
+        try:
+            _tokenizer = GPT2TokenizerFast.from_pretrained("distilgpt2")
+            _model = GPT2LMHeadModel.from_pretrained("distilgpt2")
 
-        import torch as _torch
-        if _torch.backends.mps.is_available():
-            device = _torch.device("mps")
-        elif _torch.cuda.is_available():
-            device = _torch.device("cuda")
-        else:
-            device = _torch.device("cpu")
+            import torch as _torch
+            if _torch.backends.mps.is_available():
+                device = _torch.device("mps")
+            elif _torch.cuda.is_available():
+                device = _torch.device("cuda")
+            else:
+                device = _torch.device("cpu")
 
-        _model = _model.to(device)
-        _model.eval()
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load distilgpt2: {exc}") from exc
+            _model = _model.to(device)
+            _model.eval()
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load distilgpt2: {exc}") from exc
 
 
 class PerplexityScorer:
@@ -68,7 +73,7 @@ class PerplexityScorer:
         input_ids = inputs["input_ids"].to(_model.device)
         with torch.no_grad():
             outputs = _model(input_ids, labels=input_ids)
-        return math.exp(outputs.loss.item())
+        return math.exp(min(outputs.loss.item(), 709.0))
 
     def score(self, text: str) -> float:
         """Return normalised perplexity score in [0, 1]."""
