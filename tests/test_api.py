@@ -78,6 +78,7 @@ def test_chat_completions_includes_routing_metadata(client):
         })
     assert "X-Routed-To" in resp.headers
     assert "X-Complexity-Score" in resp.headers
+    assert "X-Model-Used" in resp.headers
 
 
 def test_stats_endpoint(client):
