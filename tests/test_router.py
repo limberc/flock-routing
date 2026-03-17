@@ -65,5 +65,6 @@ def test_returns_model_config_for_remote(config_threshold_05):
     router = Router(config_threshold_05)
     router._compute = lambda _: 0.9
     destination, _ = router.route(make_request("Hi"))
+    assert destination == "remote"
     model_cfg = router.model_config_for(destination)
     assert model_cfg.model == "remote-model"
