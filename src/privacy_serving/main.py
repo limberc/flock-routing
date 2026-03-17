@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import os
-from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import JSONResponse
 
 from privacy_serving.clients import ModelClient
@@ -18,13 +17,7 @@ def create_app(config: Config) -> FastAPI:
     router = Router(config)
     stats = StatsTracker()
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        app.state.router = router
-        app.state.stats = stats
-        yield
-
-    app = FastAPI(title="Privacy Serving Proxy", lifespan=lifespan)
+    app = FastAPI(title="Privacy Serving Proxy")
 
     @app.get("/v1/models")
     async def list_models() -> dict[str, Any]:
@@ -38,6 +31,8 @@ def create_app(config: Config) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest) -> Response:
+        if request.stream:
+            raise HTTPException(status_code=501, detail="Streaming is not supported by this proxy.")
         destination, score = router.route(request)
         model_config = router.model_config_for(destination)
 

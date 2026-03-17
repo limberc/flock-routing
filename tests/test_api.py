@@ -94,3 +94,13 @@ def test_stats_endpoint(client):
 def test_invalid_request_returns_422(client):
     resp = client.post("/v1/chat/completions", json={"model": "x"})  # missing messages
     assert resp.status_code == 422
+
+
+def test_stream_not_supported_returns_501(client):
+    resp = client.post("/v1/chat/completions", json={
+        "model": "auto",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+    assert resp.status_code == 501
+    assert "Streaming" in resp.json()["detail"]
