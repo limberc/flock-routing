@@ -19,9 +19,11 @@ src/privacy_serving/complexity/
     linguistic.py     # LinguisticScorer using pure-Python text features
 ```
 
-No other module changes. The `Router`, `main.py`, and all tests that call `compute_complexity` continue to work without modification.
+No other module changes. The `Router`, `main.py`, and all tests that call `compute_complexity` continue to work without modification. Note: existing threshold assertions in `tests/test_complexity.py` (e.g. `< 0.2`, `>= 0.4`) will be revised to match the new scorer's absolute score distribution.
 
-New dependency: `transformers>=4.40` (PyTorch already present in the environment).
+New dependencies added to `pyproject.toml`:
+- `transformers>=4.40`
+- `torch>=2.0`
 
 ---
 
@@ -34,21 +36,42 @@ Use `distilgpt2` to compute the mean cross-entropy loss over the input tokens. A
 ### Implementation
 
 - Model (`GPT2LMHeadModel`) and tokenizer (`GPT2TokenizerFast`) are module-level singletons, loaded lazily on first call via a `_load_model()` helper
+- Device selection: use MPS if available (Apple Silicon), else CUDA if available, else CPU
 - Model is set to `eval()` mode; all inference runs under `torch.no_grad()`
-- Input is truncated to **512 tokens** (distilgpt2's context window); this is sufficient for routing decisions
+- Input is truncated to **512 tokens** (distilgpt2's context window)
 - Raw perplexity = `exp(mean cross-entropy loss)`
-- Normalisation: `min(log(ppl) / log(500), 1.0)` using natural log
-  - ppl ≈ 20–50 → score ≈ 0.0–0.3 (conversational text)
-  - ppl ≈ 50–150 → score ≈ 0.3–0.6 (technical documentation)
-  - ppl ≈ 150–500 → score ≈ 0.6–1.0 (specialized academic / domain text)
-- If the model fails to load, raise `RuntimeError` immediately at first call with a clear message; do not silently fall back
+
+**Normalisation** — anchored to the practical floor of distilgpt2 (~20 ppl for fluent English):
+
+```
+MIN_PPL = 20.0   # floor: fluent everyday text
+MAX_PPL = 500.0  # ceiling: dense academic / highly specialized domain text
+
+score = clamp((log(ppl) - log(MIN_PPL)) / (log(MAX_PPL) - log(MIN_PPL)), 0.0, 1.0)
+```
+
+Calibration table:
+
+| ppl | score | Example |
+|-----|-------|---------|
+| 20 | 0.00 | Simple conversational text |
+| 50 | 0.28 | Technical documentation |
+| 150 | 0.63 | Specialized academic text |
+| 500 | 1.00 | Dense domain-specific / out-of-distribution text |
+
+All log operations use natural log (`math.log`).
+
+- If the model fails to load, raise `RuntimeError` with a clear message on first call
+- Recommended: call `PerplexityScorer().score("warmup")` inside `create_app()` so the model is loaded at startup rather than on the first live request (avoids user-visible latency spike)
+
+**Latency note:** On Apple Silicon (MPS), distilgpt2 at 512 tokens runs in ~30–60ms. On CPU it may reach 200–400ms — consider setting `MAX_TOKENS = 256` for CPU-only deployments if latency is a concern.
 
 ### Interface
 
 ```python
 class PerplexityScorer:
-    def score(self, text: str) -> float: ...   # returns normalised [0, 1]
-    def raw_perplexity(self, text: str) -> float: ...   # returns raw exp(loss)
+    def score(self, text: str) -> float: ...          # normalised [0, 1]
+    def raw_perplexity(self, text: str) -> float: ... # raw exp(loss)
 ```
 
 ---
@@ -59,35 +82,67 @@ class PerplexityScorer:
 
 Seven structural text features, each measuring a property of the text itself — no topic keywords, no domain lists. Pure Python, no NLTK or spaCy required.
 
+### Text preprocessing
+
+- Words: `re.findall(r"[a-zA-Z']+", text)` — ASCII-only; Unicode characters (Greek letters, subscripts) are silently dropped, which is an accepted limitation
+- Sentences: split on `.`, `?`, `!`; keep only segments with ≥ 3 characters; `sentence_count = max(1, len(detected_sentences))` to prevent ZeroDivisionError
+- `total_words = max(1, len(words))` to prevent ZeroDivisionError
+
 ### Features
 
-| Feature | Formula | Saturation point | Weight |
+| Feature | Formula | Normalisation | Weight |
 |---|---|---|---|
-| Flesch-Kincaid Grade Level | `0.39 × (W/S) + 11.8 × (Syl/W) − 15.59` | 18 | 20% |
-| Type-Token Ratio | `unique_words / total_words` | 0.9 | 15% |
-| Hapax ratio | `once-occurring words / total_words` | 0.7 | 15% |
-| Content-word density | `content_words / total_words` | 0.8 | 15% |
-| Average sentence length | `total_words / sentence_count` | 40 words | 15% |
-| Conditional density | `conditional_markers / sentence_count` | 2.0 | 10% |
-| Discourse connective density | `connective_markers / sentence_count` | 1.5 | 10% |
+| Flesch-Kincaid Grade Level | `0.39 × (W/S) + 11.8 × (Syl/W) − 15.59` | `clamp(max(0, grade) / 18.0, 0, 1)` | 20% |
+| Type-Token Ratio | `unique_words / total_words` | `clamp(ttr / 0.9, 0, 1)`; 0.0 if `total_words < 5` | 15% |
+| Hapax ratio | `once-occurring_words / total_words` | `clamp(hapax / 0.7, 0, 1)`; 0.0 if `total_words < 5` | 15% |
+| Content-word density | `content_words / total_words` | `clamp(density / 0.8, 0, 1)` | 15% |
+| Average sentence length | `total_words / sentence_count` | `clamp(avg_len / 40.0, 0, 1)` | 15% |
+| Conditional density | `conditional_hits / sentence_count` | `clamp(density / 2.0, 0, 1)` | 10% |
+| Discourse connective density | `connective_hits / sentence_count` | `clamp(density / 1.5, 0, 1)` | 10% |
 
-**Implementation notes:**
-- Syllables: vowel-group counting heuristic (`re.findall(r'[aeiou]+', word)`), adjusted for silent-e, minimum 1
-- Sentences: split on `.`, `?`, `!` with length ≥ 3 characters
-- Words: `re.findall(r"[a-zA-Z']+", text)`
-- Content words: words not in a hardcoded ~150-word stopword set (articles, prepositions, pronouns, auxiliaries, conjunctions)
-- Conditional markers: `if, unless, when, provided, assuming, whether, given that, in case, as long as`
-- Discourse connectives: `however, therefore, thus, consequently, hence, moreover, furthermore, nevertheless, nonetheless, although, whereas`
-- Each feature is individually clamped to [0, 1] before weighting: `min(raw_value / saturation_point, 1.0)`
-- Empty input returns 0.0 for all features
+Note: TTR and hapax ratio return 0.0 when `total_words < 5` to avoid inflated scores on trivially short inputs where all words are trivially unique.
+
+**Syllable counting** (explicit algorithm):
+
+```python
+def _count_syllables(word: str) -> int:
+    word = word.lower()
+    count = len(re.findall(r'[aeiou]+', word))   # count vowel groups
+    if word.endswith('e') and len(word) > 2 and count >= 2:
+        count -= 1                                # silent-e adjustment
+    return max(1, count)
+```
+
+**Marker detection** — all markers are detected via `text.lower().count(marker)` (substring match, not word iteration) to correctly handle multi-word phrases:
+
+- Conditional markers: `if`, `unless`, `when`, `provided`, `assuming`, `whether`, `given that`, `in case`, `as long as`
+- Discourse connectives: `however`, `therefore`, `thus`, `consequently`, `hence`, `moreover`, `furthermore`, `nevertheless`, `nonetheless`, `although`, `whereas`
+
+**Content-word stopword set** (hardcoded, 151 words):
+
+```
+a, an, the, and, but, or, nor, for, yet, so, at, by, for, in, of, on, to, up,
+as, is, was, are, were, be, been, being, have, has, had, do, does, did, will,
+would, could, should, may, might, shall, can, need, dare, ought, used, i, me,
+my, myself, we, our, ours, ourselves, you, your, yours, yourself, yourselves,
+he, him, his, himself, she, her, hers, herself, it, its, itself, they, them,
+their, theirs, themselves, what, which, who, whom, this, that, these, those,
+am, not, no, nor, too, very, just, both, each, few, more, most, other, some,
+such, than, then, there, here, where, when, how, all, any, above, after, again,
+also, back, because, before, between, down, during, each, even, from, further,
+get, into, its, itself, off, out, over, own, same, since, still, through, under,
+until, up, via, while, with, without
+```
 
 ### Interface
 
 ```python
 class LinguisticScorer:
-    def score(self, text: str) -> float: ...          # weighted average [0, 1]
-    def features(self, text: str) -> dict[str, float]: ...  # per-feature breakdown
+    def score(self, text: str) -> float: ...                   # weighted average [0, 1]
+    def features(self, text: str) -> dict[str, float]: ...     # per-feature normalised breakdown
 ```
+
+Empty input (`text == ""`) returns `score = 0.0` and all features `0.0`.
 
 ---
 
@@ -103,6 +158,8 @@ class LinguisticScorer:
 ### Public API
 
 ```python
+from dataclasses import dataclass
+
 @dataclass
 class ComplexityDetail:
     final_score: float          # combined [0, 1]
@@ -117,21 +174,36 @@ def compute_complexity_detail(messages: list[Message]) -> ComplexityDetail:
     """Returns full breakdown for logging/debugging."""
 ```
 
-- Both functions extract text from messages using `" ".join(m.content or "" for m in messages)`
+- Text extraction: `" ".join(m.content or "" for m in messages)`
 - Empty messages list → `ComplexityDetail(0.0, 0.0, 0.0, 0.0)`
-- `ComplexityScorer` is a module-level singleton instantiated at import time; sub-scorers initialise lazily
+- `ComplexityScorer` is a module-level singleton instantiated at import time; sub-scorers load lazily
 
 ---
 
 ## Testing
 
-| Test file | Coverage |
-|---|---|
-| `tests/test_complexity_linguistic.py` | Each linguistic feature in isolation; edge cases (empty, single word, single sentence) |
-| `tests/test_complexity_perplexity.py` | Score ordering (technical > conversational); normalisation bounds; model loading |
-| `tests/test_complexity.py` | All existing tests must continue to pass; add combined scorer ordering tests |
+### `tests/test_complexity_linguistic.py`
+- Each of the 7 features in isolation
+- Edge cases: empty string, single word, single sentence, no punctuation (ZeroDivisionError guard)
+- TTR/hapax return 0.0 for inputs under 5 words
+- FK grade clamped to 0.0 minimum (no negative values)
+- Score bounded [0, 1] for all inputs
 
-Perplexity tests may use `unittest.mock.patch` to avoid loading the model in CI.
+### `tests/test_complexity_perplexity.py`
+- Score ordering: technical prompt scores higher than casual prompt
+- Score bounded [0, 1]
+- `raw_perplexity` > 1.0 for any real input
+- Model loading can be patched with `unittest.mock.patch` for fast CI
+
+### `tests/test_complexity.py` (revised)
+- All existing tests retained but thresholds revised to match new scorer distribution
+- Trivial prompt ("Hi") → score < 0.35
+- Short factual → score < 0.45
+- Complex reasoning prompt → score > 0.55
+- Many questions > single question (relative)
+- Score bounded [0, 1]
+- Empty messages → 0.0
+- Message-count ordering test dropped (message count is no longer a signal; content is)
 
 ---
 
@@ -139,9 +211,10 @@ Perplexity tests may use `unittest.mock.patch` to avoid loading the model in CI.
 
 1. Delete `src/privacy_serving/complexity.py`
 2. Create `src/privacy_serving/complexity/` package as specified
-3. Add `transformers>=4.40` to `pyproject.toml` dependencies
-4. All existing tests pass without modification
-5. Update `README.md` complexity algorithm section
+3. Add `transformers>=4.40` and `torch>=2.0` to `[project] dependencies` in `pyproject.toml`
+4. Add warmup call in `create_app()`: `ComplexityScorer().score("warmup")`
+5. Revise threshold assertions in `tests/test_complexity.py`
+6. Update `README.md` complexity algorithm section
 
 ---
 
@@ -151,3 +224,4 @@ Perplexity tests may use `unittest.mock.patch` to avoid loading the model in CI.
 - Online learning / updating weights from routing outcomes
 - Per-domain threshold tuning
 - Caching perplexity scores across requests
+- Unicode / non-ASCII text support in linguistic scorer
