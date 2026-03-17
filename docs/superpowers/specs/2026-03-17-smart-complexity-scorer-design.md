@@ -38,7 +38,7 @@ Use `distilgpt2` to compute the mean cross-entropy loss over the input tokens. A
 - Model (`GPT2LMHeadModel`) and tokenizer (`GPT2TokenizerFast`) are module-level singletons, loaded lazily on first call via a `_load_model()` helper
 - Device selection: use MPS if available (Apple Silicon), else CUDA if available, else CPU
 - Model is set to `eval()` mode; all inference runs under `torch.no_grad()`
-- Input is truncated to **512 tokens** (distilgpt2's context window)
+- Input is truncated to **512 tokens** as a latency-optimized limit (distilgpt2's actual context window is 1024 tokens; 512 is a deliberate conservative choice for speed)
 - Raw perplexity = `exp(mean cross-entropy loss)`
 
 **Normalisation** — anchored to the practical floor of distilgpt2 (~20 ppl for fluent English):
@@ -62,7 +62,7 @@ Calibration table:
 All log operations use natural log (`math.log`).
 
 - If the model fails to load, raise `RuntimeError` with a clear message on first call
-- Recommended: call `PerplexityScorer().score("warmup")` inside `create_app()` so the model is loaded at startup rather than on the first live request (avoids user-visible latency spike)
+- **Warmup:** `__init__.py` exposes a module-level `warmup()` function that calls `_scorer.perplexity.score("warmup")`. Call it in `create_app()` — `from privacy_serving.complexity import warmup; warmup()` — so the model loads at startup rather than on the first live request (avoids user-visible latency spike). Do **not** call `PerplexityScorer().score("warmup")` directly; that creates a throwaway instance and does not warm the module singleton.
 
 **Latency note:** On Apple Silicon (MPS), distilgpt2 at 512 tokens runs in ~30–60ms. On CPU it may reach 200–400ms — consider setting `MAX_TOKENS = 256` for CPU-only deployments if latency is a concern.
 
@@ -85,7 +85,7 @@ Seven structural text features, each measuring a property of the text itself —
 ### Text preprocessing
 
 - Words: `re.findall(r"[a-zA-Z']+", text)` — ASCII-only; Unicode characters (Greek letters, subscripts) are silently dropped, which is an accepted limitation
-- Sentences: split on `.`, `?`, `!`; keep only segments with ≥ 3 characters; `sentence_count = max(1, len(detected_sentences))` to prevent ZeroDivisionError
+- Sentences: split via `re.split(r'[.?!]', text)`, then keep only segments with ≥ 3 characters; `sentence_count = max(1, len(detected_sentences))` to prevent ZeroDivisionError
 - `total_words = max(1, len(words))` to prevent ZeroDivisionError
 
 ### Features
@@ -113,25 +113,31 @@ def _count_syllables(word: str) -> int:
     return max(1, count)
 ```
 
-**Marker detection** — all markers are detected via `text.lower().count(marker)` (substring match, not word iteration) to correctly handle multi-word phrases:
+**Marker detection** — multi-word markers are detected via `text.lower().count(marker)` (substring match). The single-character marker `if` must use word-boundary matching — `len(re.findall(r'\bif\b', text_lower))` — to avoid false positives inside words like "wifi", "tariff", "notify", "specify". All other markers use `.count()`.
 
-- Conditional markers: `if`, `unless`, `when`, `provided`, `assuming`, `whether`, `given that`, `in case`, `as long as`
+- Conditional markers: `if` (word-boundary), `unless`, `when`, `provided`, `assuming`, `whether`, `given that`, `in case`, `as long as`
 - Discourse connectives: `however`, `therefore`, `thus`, `consequently`, `hence`, `moreover`, `furthermore`, `nevertheless`, `nonetheless`, `although`, `whereas`
 
-**Content-word stopword set** (hardcoded, 151 words):
+**Content-word stopword set** (hardcoded as a `frozenset`, 130 unique words — deduplicated):
 
-```
-a, an, the, and, but, or, nor, for, yet, so, at, by, for, in, of, on, to, up,
-as, is, was, are, were, be, been, being, have, has, had, do, does, did, will,
-would, could, should, may, might, shall, can, need, dare, ought, used, i, me,
-my, myself, we, our, ours, ourselves, you, your, yours, yourself, yourselves,
-he, him, his, himself, she, her, hers, herself, it, its, itself, they, them,
-their, theirs, themselves, what, which, who, whom, this, that, these, those,
-am, not, no, nor, too, very, just, both, each, few, more, most, other, some,
-such, than, then, there, here, where, when, how, all, any, above, after, again,
-also, back, because, before, between, down, during, each, even, from, further,
-get, into, its, itself, off, out, over, own, same, since, still, through, under,
-until, up, via, while, with, without
+```python
+STOPWORDS = frozenset({
+    "a", "above", "after", "again", "all", "also", "am", "an", "and", "any",
+    "are", "as", "at", "back", "be", "because", "been", "being", "before",
+    "between", "both", "but", "by", "can", "could", "dare", "did", "do",
+    "does", "down", "during", "each", "even", "few", "for", "from", "further",
+    "get", "had", "has", "have", "he", "her", "here", "hers", "herself", "him",
+    "himself", "his", "how", "i", "in", "into", "is", "it", "its", "itself",
+    "just", "me", "might", "more", "most", "my", "myself", "need", "no", "nor",
+    "not", "of", "off", "on", "or", "ought", "our", "ours", "ourselves", "out",
+    "over", "own", "same", "shall", "she", "should", "since", "so", "some",
+    "still", "such", "than", "that", "the", "their", "theirs", "them",
+    "themselves", "then", "there", "these", "they", "this", "those", "through",
+    "to", "too", "under", "until", "up", "used", "very", "via", "was", "we",
+    "were", "what", "when", "where", "which", "while", "who", "whom", "will",
+    "with", "without", "would", "yet", "you", "your", "yours", "yourself",
+    "yourselves",
+})
 ```
 
 ### Interface
@@ -176,7 +182,10 @@ def compute_complexity_detail(messages: list[Message]) -> ComplexityDetail:
 
 - Text extraction: `" ".join(m.content or "" for m in messages)`
 - Empty messages list → `ComplexityDetail(0.0, 0.0, 0.0, 0.0)`
-- `ComplexityScorer` is a module-level singleton instantiated at import time; sub-scorers load lazily
+- `_scorer = ComplexityScorer()` is a module-level singleton instantiated at import time; sub-scorers load lazily on first use
+- `warmup()` is a module-level function that calls `_scorer.perplexity.score("warmup")` to pre-load the model
+
+**Threshold guidance:** The default `complexity_threshold: 0.5` in `config.yaml` remains appropriate for the new scorer. Under the new distribution: "Hi" scores ~0.05–0.10, a short factual question scores ~0.20–0.35, a multi-step technical request scores ~0.55–0.75. Operators using the old heuristic scorer with a custom threshold may want to re-evaluate against their own traffic.
 
 ---
 
@@ -211,8 +220,8 @@ def compute_complexity_detail(messages: list[Message]) -> ComplexityDetail:
 
 1. Delete `src/privacy_serving/complexity.py`
 2. Create `src/privacy_serving/complexity/` package as specified
-3. Add `transformers>=4.40` and `torch>=2.0` to `[project] dependencies` in `pyproject.toml`
-4. Add warmup call in `create_app()`: `ComplexityScorer().score("warmup")`
+3. In `pyproject.toml`: add `transformers>=4.40` and `torch>=2.0` to `[project] dependencies`; remove `tiktoken` (no longer used after `complexity.py` is deleted)
+4. Add warmup call in `create_app()`: `from privacy_serving.complexity import warmup; warmup()`
 5. Revise threshold assertions in `tests/test_complexity.py`
 6. Update `README.md` complexity algorithm section
 
