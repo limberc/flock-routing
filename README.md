@@ -4,17 +4,25 @@ An OpenAI-compatible proxy that routes chat completion requests between a **loca
 
 ## How it works
 
-Every request is scored by a multi-factor complexity algorithm before it reaches a model:
+Every request is scored by a principled complexity algorithm before it reaches a model:
 
-| Factor | Weight | Signal |
-|--------|--------|--------|
-| Token length | 25% | Longer prompts carry more information to process |
-| Reasoning markers | 30% | Keywords like *analyze*, *prove*, *step by step* |
-| Code / math content | 25% | Fenced code blocks, formal notation (∫, O(n), …) |
-| Question multiplicity | 10% | Number of `?` marks in the conversation |
-| Conversation depth | 10% | Number of turns in the multi-turn context |
+| Component | Weight | Signal |
+|-----------|--------|--------|
+| Perplexity (distilgpt2) | 55% | Language model assigns higher loss to specialized, technical, or domain-specific text that a weak local model is unlikely to handle well |
+| Linguistic features | 45% | Structural properties: Flesch-Kincaid readability, vocabulary richness (TTR, hapax ratio), content-word density, sentence length, conditional clauses, discourse connectives |
 
 The score is a float in `[0.0, 1.0]`. Requests at or above `complexity_threshold` go to the remote model; everything below stays local.
+
+**Calibration guide:**
+
+| Score range | Typical content |
+|-------------|-----------------|
+| 0.05–0.10 | Simple greetings and short conversational text |
+| 0.20–0.35 | Short factual questions |
+| 0.55–0.75 | Multi-step technical or analytical requests |
+| > 0.80 | Dense domain-specific or highly specialized text |
+
+> **Note on latency:** The perplexity component runs distilgpt2 locally (~30–60ms on Apple Silicon MPS, ~200–400ms on CPU). The model is loaded at server startup to avoid first-request latency.
 
 ## Quickstart
 
