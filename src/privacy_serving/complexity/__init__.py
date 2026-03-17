@@ -1,64 +1,59 @@
 # src/privacy_serving/complexity/__init__.py
-# Temporary shim: reproduces heuristic scorer while new components are built.
-# This file will be replaced entirely in Task 5.
 from __future__ import annotations
 
-import tiktoken
+from dataclasses import dataclass
 
 from privacy_serving.models import Message
-
-_ENCODER = None
-
-
-def _get_encoder():
-    global _ENCODER
-    if _ENCODER is None:
-        _ENCODER = tiktoken.get_encoding("cl100k_base")
-    return _ENCODER
+from privacy_serving.complexity.linguistic import LinguisticScorer
+from privacy_serving.complexity.perplexity import PerplexityScorer, _normalise_perplexity
 
 
-def _count_tokens(text: str) -> int:
-    return len(_get_encoder().encode(text))
+@dataclass
+class ComplexityDetail:
+    final_score: float        # combined weighted score [0, 1]
+    perplexity_score: float   # normalised perplexity sub-score [0, 1]
+    linguistic_score: float   # linguistic sub-score [0, 1]
+    raw_perplexity: float     # raw exp(loss) for diagnostics
 
 
-_REASONING_KEYWORDS = [
-    "analyze", "analyse", "compare", "contrast", "evaluate", "critique",
-    "step by step", "step-by-step", "prove", "derive", "explain why",
-    "how does", "why does", "what causes", "implications", "implication",
-    "trade-off", "tradeoff", "pros and cons", "advantages and disadvantages",
-    "algorithm", "optimize", "optimise", "refactor", "implement",
-    "design pattern", "architecture", "complexity", "theorem", "proof",
-]
+class ComplexityScorer:
+    def __init__(self) -> None:
+        self.perplexity = PerplexityScorer()  # model loads lazily on first call
+        self.linguistic = LinguisticScorer()  # pure Python, no lazy loading
 
-_CODE_PATTERNS = ["```", "def ", "class ", "import ", "function ", "const ", "var "]
+    def score_detail(self, text: str) -> ComplexityDetail:
+        """Score text and return full breakdown. Text must be non-empty."""
+        raw_ppl = self.perplexity.raw_perplexity(text)  # single inference pass
+        ppl_score = _normalise_perplexity(raw_ppl)
+        ling_score = self.linguistic.score(text)
+        final = 0.55 * ppl_score + 0.45 * ling_score
+        return ComplexityDetail(
+            final_score=final,
+            perplexity_score=ppl_score,
+            linguistic_score=ling_score,
+            raw_perplexity=raw_ppl,
+        )
 
-_MATH_PATTERNS = [
-    "∑", "∫", "∂", "∇", "∈", "∀", "∃", "≤", "≥",
-    "O(", "Θ(", "Ω(",
-    "equation", "theorem", "proof", "formula", "matrix",
-    "derivative", "integral", "calculus",
-]
+
+# Module-level singleton — sub-scorers load lazily on first use
+_scorer = ComplexityScorer()
 
 
 def compute_complexity(messages: list[Message]) -> float:
+    """Return complexity score in [0, 1]. Public API — signature unchanged."""
+    return compute_complexity_detail(messages).final_score
+
+
+def compute_complexity_detail(messages: list[Message]) -> ComplexityDetail:
+    """Return full score breakdown for logging/debugging."""
     if not messages:
-        return 0.0
+        return ComplexityDetail(0.0, 0.0, 0.0, 0.0)
     text = " ".join(m.content or "" for m in messages)
-    text_lower = text.lower()
-    token_count = _count_tokens(text)
-    length_score = min(token_count / 2000.0, 1.0)
-    reasoning_hits = sum(1 for kw in _REASONING_KEYWORDS if kw in text_lower)
-    reasoning_score = min(reasoning_hits / 5.0, 1.0)
-    has_code = any(pat in text for pat in _CODE_PATTERNS)
-    has_math = any(pat in text or pat in text_lower for pat in _MATH_PATTERNS)
-    domain_score = 1.0 if (has_code or has_math) else 0.0
-    question_score = min(text.count("?") / 5.0, 1.0)
-    depth_score = min(len(messages) / 10.0, 1.0)
-    return min(
-        length_score * 0.25
-        + reasoning_score * 0.30
-        + domain_score * 0.25
-        + question_score * 0.10
-        + depth_score * 0.10,
-        1.0,
-    )
+    if not text.strip():
+        return ComplexityDetail(0.0, 0.0, 0.0, 0.0)
+    return _scorer.score_detail(text)
+
+
+def warmup() -> None:
+    """Pre-load the distilgpt2 model. Call from FastAPI lifespan to avoid first-request latency."""
+    _scorer.perplexity.score("warmup")

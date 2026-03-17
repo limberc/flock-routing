@@ -27,10 +27,24 @@ def test_config():
     )
 
 
+@pytest.fixture(autouse=True)
+def mock_perplexity():
+    """Prevent distilgpt2 inference during all API tests (warmup + per-request scoring)."""
+    with patch(
+        "privacy_serving.complexity.perplexity.PerplexityScorer.raw_perplexity",
+        return_value=25.0,  # ppl=25 → normalised score ≈ 0.04 → routes local
+    ):
+        yield
+
+
 @pytest.fixture
 def client(test_config):
-    app = create_app(test_config)
-    return TestClient(app)
+    # `mock_perplexity` autouse fixture covers per-request inference.
+    # Warmup is patched here to prevent the lifespan startup call.
+    with patch("privacy_serving.complexity.warmup"):
+        app = create_app(test_config)
+        with TestClient(app) as c:
+            yield c
 
 
 def test_models_endpoint(client):
@@ -59,7 +73,6 @@ def test_chat_completions_routes_to_local(client, test_config):
     assert resp.status_code == 200
     data = resp.json()
     assert data["choices"][0]["message"]["content"] == "42"
-    # Routing header tells which model was used
     assert "X-Routed-To" in resp.headers
 
 

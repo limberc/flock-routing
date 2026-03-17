@@ -1,23 +1,31 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import JSONResponse
 
 from privacy_serving.clients import ModelClient
+from privacy_serving.complexity import warmup
 from privacy_serving.config import Config, load_config
 from privacy_serving.models import ChatCompletionRequest
 from privacy_serving.router import Router
 from privacy_serving.stats import StatsTracker
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    warmup()
+    yield
+
+
 def create_app(config: Config) -> FastAPI:
     router = Router(config)
     stats = StatsTracker()
 
-    app = FastAPI(title="Privacy Serving Proxy")
+    app = FastAPI(title="Privacy Serving Proxy", lifespan=_lifespan)
 
     @app.get("/v1/models")
     async def list_models() -> dict[str, Any]:
